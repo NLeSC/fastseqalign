@@ -1,0 +1,530 @@
+/* The MIT License
+   Copyright (c) 2012-2015 Boston College.
+   Permission is hereby granted, free of charge, to any person obtaining
+   a copy of this software and associated documentation files (the
+   "Software"), to deal in the Software without restriction, including
+   without limitation the rights to use, copy, modify, merge, publish,
+   distribute, sublicense, and/or sell copies of the Software, and to
+   permit persons to whom the Software is furnished to do so, subject to
+   the following conditions:
+   The above copyright notice and this permission notice shall be
+   included in all copies or substantial portions of the Software.
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+   BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+*/
+
+/* The 2-clause BSD License
+   Copyright 2006 Michael Farrar.
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions are
+   met:
+
+   1. Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+
+   2. Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+   HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+/*
+ *  ssw.c
+ *
+ *  Created by Mengyao Zhao on 6/22/10.
+ *  Copyright 2010 Boston College. All rights reserved.
+ *	Version 1.2.4
+ *	Last revision by Mengyao Zhao on 2022-Apr-17.
+ *
+ *  The lazy-F loop implementation was derived from SWPS3, which is
+ *  MIT licensed under ETH Zürich, Institute of Computational Science.
+ *
+ *  The core SW loop referenced the swsse2 implementation, which is
+ *  BSD licensed under Micharl Farrar.
+ */
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <limits.h>
+#include "ssw.h"
+
+#ifdef __ARM_NEON // (M1)
+#include "sse2_function.h"
+#else // x86 (Intel)
+#include "avx2_functions.h"
+#endif
+
+
+#ifdef __GNUC__
+#define LIKELY(x) __builtin_expect((x),1)
+#define UNLIKELY(x) __builtin_expect((x),0)
+#else
+#define LIKELY(x) (x)
+#define UNLIKELY(x) (x)
+#endif
+
+/* Convert the coordinate in the scoring matrix into the coordinate in one line of the band. */
+#define set_u(u, w, i, j) { int x=(i)-(w); x=x>0?x:0; (u)=(j)-x+1; }
+
+/* Convert the coordinate in the direction matrix into the coordinate in one line of the band. */
+#define set_d(u, w, i, j, p) { int x=(i)-(w); x=x>0?x:0; x=(j)-x; (u)=x*3+p; }
+
+/*! @function
+  @abstract  Round an integer to the next closest power-2 integer.
+  @param  x  integer to be rounded (in place)
+  @discussion x will be modified.
+ */
+#define kroundup32(x) (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, ++(x))
+
+typedef struct {
+	int16_t score;
+	int32_t ref;	 //0-based position
+	int32_t read;    //alignment ending position on read, 0-based
+    uint8_t *dir_mat;
+} alignment_end;
+
+typedef struct {
+	uint32_t* seq;
+	int32_t length;
+} cigar;
+
+struct _profile{
+	VEC_TYPE* profile_word;	// 0: none
+	const int8_t* read;
+	const int8_t* mat;
+	int32_t readLen;
+	int32_t n;
+};
+
+/* array index is an ASCII character value from a CIGAR,
+   element value is the corresponding integer opcode between 0 and 8 */
+const uint8_t encoded_ops[] = {
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0 /*   */, 0 /* ! */, 0 /* " */, 0 /* # */,
+	0 /* $ */, 0 /* % */, 0 /* & */, 0 /* ' */,
+	0 /* ( */, 0 /* ) */, 0 /* * */, 0 /* + */,
+	0 /* , */, 0 /* - */, 0 /* . */, 0 /* / */,
+	0 /* 0 */, 0 /* 1 */, 0 /* 2 */, 0 /* 3 */,
+	0 /* 4 */, 0 /* 5 */, 0 /* 6 */, 0 /* 7 */,
+	0 /* 8 */, 0 /* 9 */, 0 /* : */, 0 /* ; */,
+	0 /* < */, 7 /* = */, 0 /* > */, 0 /* ? */,
+	0 /* @ */, 0 /* A */, 0 /* B */, 0 /* C */,
+	2 /* D */, 0 /* E */, 0 /* F */, 0 /* G */,
+	5 /* H */, 1 /* I */, 0 /* J */, 0 /* K */,
+	0 /* L */, 0 /* M */, 3 /* N */, 0 /* O */,
+	6 /* P */, 0 /* Q */, 0 /* R */, 4 /* S */,
+	0 /* T */, 0 /* U */, 0 /* V */, 0 /* W */,
+	8 /* X */, 0 /* Y */, 0 /* Z */, 0 /* [ */,
+	0 /* \ */, 0 /* ] */, 0 /* ^ */, 0 /* _ */,
+	0 /* ` */, 0 /* a */, 0 /* b */, 0 /* c */,
+	0 /* d */, 0 /* e */, 0 /* f */, 0 /* g */,
+	0 /* h */, 0 /* i */, 0 /* j */, 0 /* k */,
+	0 /* l */, 0 /* m */, 0 /* n */, 0 /* o */,
+	0 /* p */, 0 /* q */, 0 /* r */, 0 /* s */,
+	0 /* t */, 0 /* u */, 0 /* v */, 0 /* w */,
+	0 /* x */, 0 /* y */, 0 /* z */, 0 /* { */,
+	0 /* | */, 0 /* } */, 0 /* ~ */, 0 /*  */
+};
+
+
+
+static VEC_TYPE* qP_word (const int8_t* read_num,
+                          const int8_t* mat,
+                          const int32_t readLen,
+                          const int32_t n) {
+
+    int32_t segLen = (readLen + ((sizeof(VEC_TYPE) / sizeof(int16_t)) - 1)) /
+                     (sizeof(VEC_TYPE) / sizeof(int16_t)); /* number of segment */
+    VEC_TYPE *vProfile = (VEC_TYPE *) aligned_alloc(sizeof(VEC_TYPE), n * segLen * sizeof(VEC_TYPE));
+    int16_t *t = (int16_t *) vProfile;
+    int32_t nt, i, j;
+    int32_t segNum;
+
+    /* Generate query profile rearrange query sequence & calculate the weight of match/mismatch */
+    for (nt = 0; LIKELY(nt < n); nt++) {
+        for (i = 0; i < segLen; i++) {
+            j = i;
+            for (segNum = 0; LIKELY(segNum < (sizeof(VEC_TYPE) / sizeof(int16_t))); segNum++) {
+                *t++ = j >= readLen ? 0 : mat[nt * n + read_num[j]];
+                j += segLen;
+            }
+        }
+    }
+    return vProfile;
+}
+
+
+static alignment_end* ssw_int16 (const int8_t* ref,
+                                 int32_t refLen,
+                                 int32_t readLen,
+                                 const uint8_t weight_gapO, /* will be used as - */
+                                 const uint8_t weight_gapE, /* will be used as - */
+                                 const VEC_TYPE* vProfile) {
+
+
+    int16_t max = SHRT_MIN;                             /* the max alignment score */
+    int32_t end_read = readLen - 1;
+    int32_t end_ref = 0; /* 1_based best alignment ending point; Initialized as isn't aligned - 0. */
+    int32_t segLen = (readLen + ((sizeof(VEC_TYPE) / sizeof(int16_t)) - 1)) /
+                     (sizeof(VEC_TYPE) / sizeof(int16_t)); /* number of segment */
+
+    alignment_end *best = (alignment_end *) calloc(1, sizeof(alignment_end));
+
+    int32_t segLen_per_btvec = segLen / 8;
+
+    int32_t seg_left = segLen - (8 * segLen_per_btvec);
+
+
+
+
+    /* Define 16 byte 0 vector. */
+    VEC_TYPE vNeg = VEC_SET1(SHRT_MIN);
+    VEC_TYPE vZero = VEC_SET1(0);
+
+    VEC_TYPE *pvHStore = (VEC_TYPE *) aligned_alloc(sizeof(VEC_TYPE), segLen * sizeof(VEC_TYPE));
+    //memset(pvHStore, 0, segLen*sizeof(VEC_TYPE));
+    VEC_TYPE *pvHLoad = (VEC_TYPE *) aligned_alloc(sizeof(VEC_TYPE), segLen * sizeof(VEC_TYPE));
+    //memset(pvHLoad, 0, segLen*sizeof(VEC_TYPE));
+    VEC_TYPE *pvE = (VEC_TYPE *) aligned_alloc(sizeof(VEC_TYPE), segLen * sizeof(VEC_TYPE));
+    //int itr;
+    /*for (itr = 0; itr < segLen; itr++){
+        pvE[itr] = vNeg;
+    }*/
+    VEC_TYPE *pvHmax = (VEC_TYPE *) aligned_alloc(sizeof(VEC_TYPE), segLen * sizeof(VEC_TYPE));
+
+    int32_t i, j, k, l;
+    /* 16 byte insertion begin vector */
+    VEC_TYPE vGapOE = VEC_SET1(weight_gapO + weight_gapE);
+
+    /* 16 byte insertion extension vector */
+    VEC_TYPE vGapE = VEC_SET1(weight_gapE);
+
+    VEC_TYPE vMaxScore = vNeg; /* Trace the highest score of the whole SW matrix. */
+    VEC_TYPE vMaxMark = vNeg; /* Trace the highest score till the previous column. */
+
+    VEC_TYPE vTemp;
+    int32_t begin = 0, end = refLen, step = 1;
+
+    VEC_TYPE bt_vec_init = VEC_SET1(0);
+    VEC_TYPE d_dir_init = VEC_SET1(0x0001);
+    VEC_TYPE i_dir_init = VEC_SET1(0x0003);
+
+
+    VEC_TYPE *dir_mat_align = (VEC_TYPE *) aligned_alloc(sizeof(VEC_TYPE), segLen * refLen * sizeof(VEC_TYPE));
+
+    //memset(dir_vec_align, 0, segLen*refLen*sizeof(VEC_TYPE));
+
+
+
+    VEC_TYPE bt_vec_cache[4];
+
+    int first_time = 0;
+
+
+    /* outer loop to process the reference sequence */
+
+    for (i = begin; LIKELY(i != end); i += step) {
+        uint64_t cmp;
+        VEC_TYPE e, vF = vNeg; /* Initialize F value to 0.
+							   Any errors to vH values will be corrected in the Lazy_F loop.
+							 */
+        VEC_TYPE vH = pvHStore[segLen - 1];
+
+
+        vH = VEC_SLL(vH, 2); /* Shift the 128-bit value in vH left by 2 byte. */
+
+        /* Swap the 2 H buffers. */
+        VEC_TYPE *pv = pvHLoad;
+
+        VEC_TYPE vMaxColumn = vNeg; /* vMaxColumn is used to record the max values of column i. */
+
+        const VEC_TYPE *vP = vProfile + ref[i] * segLen; /* Right part of the vProfile */
+        pvHLoad = pvHStore;
+        pvHStore = pv;
+
+
+        /* inner loop to process the query sequence */
+        for (l = 0; l < segLen_per_btvec; l++) {
+            VEC_TYPE bt_vec = bt_vec_init;
+            VEC_TYPE i_dir = i_dir_init;
+            VEC_TYPE d_dir = d_dir_init;
+            for (j = 0; j < 8; j++) {
+                e = VEC_LOAD(pvE + (l * 8) + j);
+
+                if (first_time) {
+                    vH = vZero;
+                    e = vNeg;
+                }
+                vH = VEC_ADDS(vH, VEC_LOAD(vP + (l * 8) + j));
+
+                /* Get max from vH, vE and vF. */
+
+
+
+
+                vH = VEC_MAX(vH, e);
+                vH = VEC_MAX(vH, vF);
+
+                VEC_TYPE mask = VEC_CMPEQ(vH, vF);
+
+                bt_vec = VEC_OR(bt_vec, VEC_AND(mask, i_dir));
+
+                mask = VEC_CMPEQ(vH, e);
+
+                bt_vec = VEC_OR(bt_vec, VEC_AND(mask, d_dir));
+
+                i_dir = VEC_SLL_ELE(i_dir, 2);
+                d_dir = VEC_SLL_ELE(d_dir, 2);
+
+                vMaxColumn = VEC_MAX(vMaxColumn, vH);
+
+                /* Save vH values. */
+
+                VEC_STORE(pvHStore + (l * 8) + j, vH);
+
+                /* Update vE value. */
+                //vH = _mm_subs_epu16(vH, vGapOE); /* saturation arithmetic, result >= 0 */
+                vH = VEC_SUBS(vH, vGapOE); /* saturation arithmetic, result >= 0 */
+                //e = _mm_subs_epu16(e, vGapE);
+                e = VEC_SUBS(e, vGapE);
+                e = VEC_MAX(e, vH);
+                VEC_STORE(pvE + (l * 8) + j, e);
+
+                /* Update vF value. */
+                //vF = _mm_subs_epu16(vF, vGapE);
+                vF = VEC_SUBS(vF, vGapE);
+                vF = VEC_MAX(vF, vH);
+
+                /* Load the next vH. */
+                vH = VEC_LOAD(pvHLoad + (l * 8) + j);
+            }
+
+            //VEC_STORE(bt_vec_cache_align + (l*sizeof(VEC_TYPE)), bt_vec);
+            bt_vec_cache[l] = bt_vec;
+        }
+
+        VEC_TYPE bt_vec = bt_vec_init;
+        VEC_TYPE i_dir = i_dir_init;
+        VEC_TYPE d_dir = d_dir_init;
+
+        for (j = segLen_per_btvec * 8; j < segLen; j++) {
+            e = VEC_LOAD(pvE + (l * 8) + j);
+
+            if (first_time) {
+                vH = vZero;
+                e = vNeg;
+            }
+            vH = VEC_ADDS(vH, VEC_LOAD(vP + j));
+
+            /* Get max from vH, vE and vF. */
+            e = VEC_LOAD(pvE + j);
+
+            vH = VEC_MAX(vH, e);
+            vH = VEC_MAX(vH, vF);
+
+            VEC_TYPE mask = VEC_CMPEQ(vH, vF);
+
+            bt_vec = VEC_OR(bt_vec, VEC_AND(mask, i_dir));
+
+            mask = VEC_CMPEQ(vH, e);
+
+            bt_vec = VEC_OR(bt_vec, VEC_AND(mask, d_dir));
+
+            i_dir = VEC_SLL_ELE(i_dir, 2);
+            d_dir = VEC_SLL_ELE(d_dir, 2);
+
+            vMaxColumn = VEC_MAX(vMaxColumn, vH);
+
+            /* Save vH values. */
+
+            VEC_STORE(pvHStore + j, vH);
+
+            /* Update vE value. */
+            //vH = _mm_subs_epu16(vH, vGapOE); /* saturation arithmetic, result >= 0 */
+            vH = VEC_SUBS(vH, vGapOE); /* saturation arithmetic, result >= 0 */
+            //e = _mm_subs_epu16(e, vGapE);
+            e = VEC_SUBS(e, vGapE);
+            e = VEC_MAX(e, vH);
+            VEC_STORE(pvE + j, e);
+
+            /* Update vF value. */
+            //vF = _mm_subs_epu16(vF, vGapE);
+            vF = VEC_SUBS(vF, vGapE);
+            vF = VEC_MAX(vF, vH);
+
+            /* Load the next vH. */
+            vH = VEC_LOAD(pvHLoad + j);
+        }
+
+
+
+        //VEC_STORE(bt_vec_cache_align + (l*sizeof(VEC_TYPE)), bt_vec);
+        bt_vec_cache[l] = bt_vec;
+
+
+        /* Lazy_F loop: has been revised to disallow adjecent insertion and then deletion, so don't update E(i, j), learn from SWPS3 */
+        for (k = 0; LIKELY(k < 8); ++k) {
+            vF = VEC_SLL(vF, 2);
+            for (l = 0; l < segLen_per_btvec; l++) {
+                VEC_TYPE i_dir = i_dir_init;
+                //VEC_TYPE bt_vec = VEC_LOAD(bt_vec_cache_align + (l*sizeof(VEC_TYPE)));
+                VEC_TYPE bt_vec = bt_vec_cache[l];
+                for (j = 0; j < 8; ++j) {
+                    vH = VEC_LOAD(pvHStore + (l * 8) + j);
+                    VEC_TYPE mask = VEC_CMPGT(vF, vH);
+                    bt_vec = VEC_OR(bt_vec, VEC_AND(mask, i_dir));
+                    i_dir = VEC_SLL_ELE(i_dir, 2);
+                    vH = VEC_MAX(vH, vF);
+                    vMaxColumn = VEC_MAX(vMaxColumn, vH); //newly added line
+                    VEC_STORE(pvHStore + (l * 8) + j, vH);
+                    //vH = _mm_subs_epu16(vH, vGapOE);
+                    vH = VEC_SUBS(vH, vGapOE);
+                    //vF = _mm_subs_epu16(vF, vGapE);
+                    vF = VEC_SUBS(vF, vGapE);
+                    if (UNLIKELY(!VEC_MOVEMASK(VEC_CMPGT(vF, vH)))) goto end;
+                }
+                bt_vec_cache[l] = bt_vec;
+                //VEC_STORE((segLen*(sizeof(VEC_TYPE)/sizeof(int16_t))*sizeof(int16_t)*i) + (l*sizeof(VEC_TYPE)), bt_vec);
+
+            }
+            VEC_TYPE i_dir = i_dir_init;
+            //VEC_TYPE bt_vec = VEC_LOAD(bt_vec_cache_align + (l*sizeof(VEC_TYPE)));
+            VEC_TYPE bt_vec = bt_vec_cache[l];
+            for (j = segLen_per_btvec * 8; j < segLen; j++) {
+                vH = VEC_LOAD(pvHStore + j);
+                VEC_TYPE mask = VEC_CMPGT(vF, vH);
+                bt_vec = VEC_OR(bt_vec, VEC_AND(mask, i_dir));
+                i_dir = VEC_SLL_ELE(i_dir, 2);
+                vH = VEC_MAX(vH, vF);
+                vMaxColumn = VEC_MAX(vMaxColumn, vH); //newly added line
+                VEC_STORE(pvHStore + j, vH);
+                //vH = _mm_subs_epu16(vH, vGapOE);
+                vH = VEC_SUBS(vH, vGapOE);
+                //vF = _mm_subs_epu16(vF, vGapE);
+                vF = VEC_SUBS(vF, vGapE);
+                if (UNLIKELY(!VEC_MOVEMASK(VEC_CMPGT(vF, vH)))) goto end;
+            }
+            bt_vec_cache[l] = bt_vec;
+        }
+
+
+        end:
+        bt_vec_cache[l] = bt_vec;
+        for (l = 0; l < segLen_per_btvec + (seg_left > 0 ? 1 : 0); l++) {
+            VEC_STORE(dir_mat_align + l + (i * segLen), bt_vec_cache[l]);
+        }
+        vMaxScore = VEC_MAX(vMaxScore, vMaxColumn);
+        vTemp = VEC_CMPEQ(vMaxMark, vMaxScore);
+        cmp = VEC_MOVEMASK(vTemp);
+        if (cmp != (uint64_t) VEC_ALL_ONES) {
+            int16_t temp;
+            vMaxMark = vMaxScore;
+            max_of_vec(temp, vMaxScore);
+            vMaxScore = vMaxMark;
+            if (LIKELY(temp > max)) {
+                max = temp;
+                end_ref = i;
+                for (j = 0; LIKELY(j < segLen); ++j) pvHmax[j] = pvHStore[j];
+            }
+        }
+        first_time = 0;
+    }
+
+    /* Trace the alignment ending position on read. */
+    int16_t *t = (int16_t *) pvHmax;
+    int32_t column_len = segLen * (sizeof(VEC_TYPE) / sizeof(int16_t));
+    for (i = 0; LIKELY(i < column_len); ++i, ++t) {
+        int32_t temp;
+        if (*t == max) {
+            temp = i / (sizeof(VEC_TYPE) / sizeof(int16_t)) + i % (sizeof(VEC_TYPE) / sizeof(int16_t)) * segLen;
+            if (temp < end_read) end_read = temp;
+        }
+    }
+
+    free(pvHmax);
+    free(pvE);
+    free(pvHLoad);
+    free(pvHStore);
+
+
+    best->score = max;
+    best->ref = end_ref + 1;
+    best->read = end_read + 1;
+    best->dir_mat = (uint8_t *) dir_mat_align;
+
+    return best;
+}
+
+
+
+s_profile* ssw_init (const int8_t* read, const int32_t readLen, const int8_t* mat, const int32_t n) {
+	s_profile* p = (s_profile*)calloc(1, sizeof(struct _profile));
+	p->profile_word = 0;
+    p->profile_word = qP_word (read, mat, readLen, n);
+	p->read = read;
+	p->mat = mat;
+	p->readLen = readLen;
+	p->n = n;
+	return p;
+}
+
+void init_destroy (s_profile* p) {
+	free(p->profile_word);
+	free(p);
+}
+
+s_align* ssw_align (const s_profile* prof,
+					const int8_t* ref,
+				  	int32_t refLen,
+				  	const int8_t weight_gapO,
+				  	const int8_t weight_gapE) {
+
+	alignment_end* best = 0;
+	int32_t readLen = prof->readLen;
+	s_align* r = (s_align*)calloc(1, sizeof(s_align));
+	r->ref_begin = -1;
+	r->read_begin = -1;
+	// Find the alignment scores and ending positions
+	best = ssw_int16(ref, refLen, readLen, weight_gapO, weight_gapE, prof->profile_word);
+
+	r->score = best->score;
+	r->ref_end = best->ref; // 0_based, always count from the input seq begin
+	r->read_end = best->read;   // 0_based, count from the alignment begin (aligned length of the read)
+
+    free(best->dir_mat);
+	free(best);
+
+	return r;
+}
+
+void align_destroy (s_align* a) {
+	free(a);
+}
+
